@@ -1,6 +1,6 @@
 /*
 PKE Meter with Teensy 4.0 and DFRobot Sensors
-This project integrates multiple sensors (H2S, CO, VOC, CH4) with visual and audio feedback using LEDs, a servo, and a DFPlayer Mini.
+This project integrates multiple sensors (H2S, CO, VOC, CH4, Magnetometer) with visual and audio feedback using LEDs, a servo, and a DFPlayer Mini.
 
 Pin Definitions:
 SERVO_PIN: Pin A7
@@ -14,6 +14,8 @@ CO_SENSOR_PIN: Pin A4
 VOC_SENSOR_PIN: Pin A5
 CH4_SENSOR_PIN: Pin A6
 
+Magnetometer (Teensy Prop Shield): I2C pins (SDA, SCL)
+
 Screen (Adafruit ST7789):
 #define TFT_CS 10    // Chip Select
 #define TFT_DC 9     // Data/Command
@@ -23,16 +25,22 @@ Screen (Adafruit ST7789):
 
 The sketch reads sensor values, updates a display, controls LEDs, and manages sound output based on sensor data.
 It includes a debug mode for easier troubleshooting and monitoring.
+
+Additional functionality:
+- Reads magnetometer data from the Teensy Prop Shield.
+- Displays magnetometer data on the screen along with other sensor values.
+- Provides feedback based on magnetometer data.
 */
 
 #include <Wire.h>
+#include <SPI.h>
 #include <Servo.h>
 #include <Ramp.h>
 #include <TimerOne.h>
 #include <DFRobotDFPlayerMini.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
-#include <SPI.h>
+#include <Magnetometer.h>
 
 #define DEBUG_MODE
 
@@ -51,10 +59,9 @@ It includes a debug mode for easier troubleshooting and monitoring.
 // ----------------------------------------------------------------------[ DEFINITIONS ]
 
 #define CALIBRATION_TIME 13000
-
 #define NUM_POT_SAMPLES 5
 #define NUM_SENSORS 4
-#define NUM_SAMPLES 5 
+#define NUM_SAMPLES 5
 #define MOVING_AVERAGE_SIZE 5
 #define DFPLAYER_INIT_RETRIES 5
 
@@ -114,6 +121,7 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 DFRobotDFPlayerMini myDFPlayer;
 rampUnsignedInt wingRamp;
 Servo myServo;
+Magnetometer mag; // Magnetometer instance
 
 constexpr uint8_t LED_PINS[] = { 0, 1, 2, 3, 4, 5, 6 };
 unsigned long ledInterval = (CALIBRATION_TIME / NUM_LEDS);
@@ -172,6 +180,10 @@ void debugMessage(const char* message, int delayTime);
 float convertToPPM(uint16_t rawValue, float conversionFactor);
 float convertToMGPerM3(uint16_t rawValue, float conversionFactor);
 void debugGraphUpdate(int sensorIndex, int x, int y1, int y2);
+int mapSensorValueToGraph(int sensorValue);
+void displaySensorValues(float h2s, float co, float voc, float ch4, float mx, float my, float mz);
+bool checkMagnetometer(Magnetometer &mag);
+float calculateMagneticFieldMagnitude(float mx, float my, float mz);
 
 // ----------------------------------------------------------------------[ INTIALIZATION ]
 
@@ -459,7 +471,7 @@ void initializeScreen() {
 
 void updateGraph() {
   static int x = GRAPH_X_OFFSET;
-  static float previousSensorValues[NUM_SENSORS] = {0};
+  static float previousSensorValues[NUM_SENSORS + 1] = {0}; // Include space for magnetometer data
 
   // Clear the previous graph area only where lines are drawn
   tft.fillRect(GRAPH_X_OFFSET, GRAPH_Y_OFFSET, GRAPH_WIDTH, GRAPH_HEIGHT, ST77XX_BLACK);
@@ -488,6 +500,27 @@ void updateGraph() {
     previousSensorValues[i] = sensorValues[i];
   }
 
+  // Handle magnetometer data
+  float mx = mag.getX();
+  float my = mag.getY();
+  float mz = mag.getZ();
+  float magneticFieldMagnitude = calculateMagneticFieldMagnitude(mx, my, mz);
+
+  int y1 = mapSensorValueToGraph(previousSensorValues[NUM_SENSORS]);
+  int y2 = mapSensorValueToGraph(magneticFieldMagnitude);
+
+  // Erase the previous line by drawing over it with the background color
+  tft.drawLine(x, y1, x + 1, y1, ST77XX_BLACK);
+
+  // Draw the new line for magnetometer
+  tft.drawLine(x, y1, x + 1, y2, getColorFromIndex(NUM_SENSORS));
+
+  // Debug graph update for magnetometer
+  debugGraphUpdate(NUM_SENSORS, x, y1, y2);
+
+  // Update previous value for next iteration
+  previousSensorValues[NUM_SENSORS] = magneticFieldMagnitude;
+
   x++;
   if (x >= GRAPH_X_OFFSET + GRAPH_WIDTH) {
     x = GRAPH_X_OFFSET;
@@ -495,11 +528,17 @@ void updateGraph() {
   }
 
   // Display sensor values on the screen
-  displaySensorValues(convertToPPM(sensorValues[0], H2S_CONVERSION_FACTOR), convertToPPM(sensorValues[1], CO_CONVERSION_FACTOR), convertToMGPerM3(sensorValues[2], VOC_CONVERSION_FACTOR), convertToPPM(sensorValues[3], CH4_CONVERSION_FACTOR));
+  displaySensorValues(convertToPPM(sensorValues[0], H2S_CONVERSION_FACTOR),
+                      convertToPPM(sensorValues[1], CO_CONVERSION_FACTOR),
+                      convertToMGPerM3(sensorValues[2], VOC_CONVERSION_FACTOR),
+                      convertToPPM(sensorValues[3], CH4_CONVERSION_FACTOR),
+                      mx, my, mz,
+                      magneticFieldMagnitude);
 }
 
+
 // Function to display sensor values at the top of the screen
-void displaySensorValues(float h2s, float co, float voc, float ch4) {
+void displaySensorValues(float h2s, float co, float voc, float ch4, float mx, float my, float mz, float magField) {
   tft.fillRect(0, 0, 240, 50, ST77XX_BLACK); // Clear previous values
 
   // Set the text color and display each sensor value
@@ -519,17 +558,22 @@ void displaySensorValues(float h2s, float co, float voc, float ch4) {
   tft.setCursor(10, 35);
   tft.setTextColor(ST77XX_YELLOW);
   tft.print("CH4: "); tft.print(ch4); tft.print(" ppm");
+
+  tft.setCursor(10, 45);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("MAG: "); tft.print(magField); tft.print(" uT");
 }
+
 
 // Draw labels for the graph
 void drawLabels() {
-  const char* labels[] = {"H2S", "CO", "VOC", "CH4"};
-  const uint16_t colors[] = {ST77XX_RED, ST77XX_GREEN, ST77XX_BLUE, ST77XX_YELLOW};
+  const char* labels[] = {"H2S", "CO", "VOC", "CH4", "MAG"};
+  const uint16_t colors[] = {ST77XX_RED, ST77XX_GREEN, ST77XX_BLUE, ST77XX_YELLOW, ST77XX_WHITE};
 
   tft.fillRect(0, 0, 240, 50, ST77XX_BLACK); // Clear the area where labels are displayed
 
-  for (int i = 0; i < 4; i++) {
-    tft.setCursor(10 + (i * 50), 5); // Position labels horizontally
+  for (int i = 0; i < 5; i++) { // Updated to include 5 labels
+    tft.setCursor(10 + (i * 45), 5); // Adjust positioning for 5 labels
     tft.setTextColor(colors[i]);
     tft.setTextSize(1);
     tft.print(labels[i]);
@@ -541,10 +585,11 @@ uint16_t getColorFromIndex(int index) {
     case 0: return ST77XX_RED;
     case 1: return ST77XX_GREEN;
     case 2: return ST77XX_BLUE;
-    default: return ST77XX_YELLOW;
+    case 3: return ST77XX_YELLOW;
+    case 4: return ST77XX_WHITE; // Color for magnetometer
+    default: return ST77XX_WHITE;
   }
 }
-
 // ----------------------------------------------------------------------[ SENSORS ]
 
 void initializeSensors() {
@@ -556,6 +601,7 @@ void initializeSensors() {
   allSensorsInitialized &= checkSensor(CO_SENSOR_PIN);
   allSensorsInitialized &= checkSensor(VOC_SENSOR_PIN);
   allSensorsInitialized &= checkSensor(CH4_SENSOR_PIN);
+  allSensorsInitialized &= checkMagnetometer(mag);
 
   if (allSensorsInitialized) {
     sensorsInitialized = true;
@@ -572,6 +618,10 @@ uint16_t movingAverage(uint16_t* values, uint8_t size) {
     sum += values[i];
   }
   return sum / size;
+}
+
+float calculateMagneticFieldMagnitude(float mx, float my, float mz) {
+  return sqrt(mx * mx + my * my + mz * mz);
 }
 
 void generateTestData(uint16_t &h2s, uint16_t &co, uint16_t &voc, uint16_t &ch4) {
@@ -596,12 +646,22 @@ bool useTestData() {
 bool checkSensor(uint8_t sensorPin) {
   int sensorValue = analogRead(sensorPin);
   if (sensorValue >= SENSOR_MIN && sensorValue <= SENSOR_MAX) {
-    debugMessage(("Sensor initialized successfully: " + String(sensorPin)).c_str(), 500);
+    debugMessage(("Sensor initialized successfully: PIN= " + String(sensorPin)).c_str(), 500);
     return true;
   } else {
-    debugMessage(("Sensor initialization failed: " + String(sensorPin)).c_str(), 500);
+    debugMessage(("Sensor initialization failed: PIN= " + String(sensorPin)).c_str(), 500);
     return false;
   }
+}
+
+bool checkMagnetometer(Magnetometer &mag) {
+    if (mag.checkConnection()) {
+        debugMessage("Magnetometer initialized successfully.", 500);
+        return true;
+    } else {
+        debugMessage("Magnetometer initialization failed.", 500);
+        return false;
+    }
 }
 
 void readSensor(uint8_t sensorPin, uint16_t &sensorValue, uint16_t *sensorHistory, uint8_t &historyIndex) {
@@ -635,6 +695,13 @@ void readSensors() {
     sensorValues[i] = movingAverage(sensorHistory[i], MOVING_AVERAGE_SIZE);
   }
 
+  // Read magnetometer data
+  mag.update();
+  float mx = mag.getX();
+  float my = mag.getY();
+  float mz = mag.getZ();
+  float magneticFieldMagnitude = calculateMagneticFieldMagnitude(mx, my, mz);
+
   // Convert and display sensor values in ppm or mg/m3
   float h2s_ppm = convertToPPM(sensorValues[0], H2S_CONVERSION_FACTOR);
   float co_ppm = convertToPPM(sensorValues[1], CO_CONVERSION_FACTOR);
@@ -644,7 +711,8 @@ void readSensors() {
   debugMessage(("H2S: " + String(h2s_ppm) + " ppm, ").c_str(), 0);
   debugMessage(("CO: " + String(co_ppm) + " ppm, ").c_str(), 0);
   debugMessage(("VOC: " + String(voc_mg_m3) + " mg/m³, ").c_str(), 0);
-  debugMessage(("CH4: " + String(ch4_ppm) + " ppm").c_str(), 500);
+  debugMessage(("CH4: " + String(ch4_ppm) + " ppm").c_str(), 0);
+  debugMessage(("MAG: " + String(magneticFieldMagnitude) + " uT").c_str(), 500);
 
   // Print raw sensor values for debugging
   Serial.print("Raw Sensor Values - H2S: ");
@@ -654,7 +722,9 @@ void readSensors() {
   Serial.print(", VOC: ");
   Serial.print(sensorValues[2]);
   Serial.print(", CH4: ");
-  Serial.println(sensorValues[3]);
+  Serial.print(sensorValues[3]);
+  Serial.print(", MAG: ");
+  Serial.println(magneticFieldMagnitude);
 }
 
 uint16_t getMaxSensorReading() {
@@ -663,6 +733,13 @@ uint16_t getMaxSensorReading() {
     if (sensorValues[i] > maxReading) {
       maxReading = sensorValues[i];
     }
+  }
+  float mx = mag.getX();
+  float my = mag.getY();
+  float mz = mag.getZ();
+  float magneticFieldMagnitude = calculateMagneticFieldMagnitude(mx, my, mz);
+  if (magneticFieldMagnitude > maxReading) {
+    maxReading = magneticFieldMagnitude;
   }
   return maxReading;
 }
